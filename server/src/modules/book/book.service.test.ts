@@ -2509,6 +2509,25 @@ describe('BookService', () => {
     });
   });
 
+  it('restores the user-specific stored progress, including its Kobo location', async () => {
+    const { service, bookRepo } = makeService();
+    bookRepo.findProgress.mockResolvedValue(null);
+    await expect(service.restoreKoboReadingStateFromProgress(5, 9)).resolves.toBe(false);
+    expect(bookRepo.syncKoboReadingStateFromProgress).not.toHaveBeenCalled();
+
+    bookRepo.findProgress.mockResolvedValue({
+      percentage: 30,
+      koboLocationSource: 'OEBPS/ch1.xhtml',
+      koboLocationType: 'KoboSpan',
+      koboLocationValue: 'kobo.25.1',
+      koboContentSourceProgressPercent: 12,
+    });
+    bookRepo.syncKoboReadingStateFromProgress.mockResolvedValue(true);
+    await expect(service.restoreKoboReadingStateFromProgress(5, 9)).resolves.toBe(true);
+    expect(bookRepo.findProgress).toHaveBeenLastCalledWith(5, 9);
+    expect(bookRepo.syncKoboReadingStateFromProgress).toHaveBeenCalledWith(5, 9, 30, 'OEBPS/ch1.xhtml', 'KoboSpan', 'kobo.25.1', 12, true);
+  });
+
   describe('clearFileProgress', () => {
     it('verifies file access and clears file-scoped progress rows', async () => {
       const { service, bookRepo } = makeService();

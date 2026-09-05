@@ -2074,6 +2074,21 @@ export class BookService {
     await this.bookRepo.syncKoboReadingStateFromProgress(userId, fileId, percentage, null, null, null, null);
   }
 
+  async restoreKoboReadingStateFromProgress(userId: number, fileId: number): Promise<boolean> {
+    const progress = await this.bookRepo.findProgress(userId, fileId);
+    if (!progress) return false;
+    return this.bookRepo.syncKoboReadingStateFromProgress(
+      userId,
+      fileId,
+      progress.percentage,
+      progress.koboLocationSource,
+      progress.koboLocationType,
+      progress.koboLocationValue,
+      progress.koboContentSourceProgressPercent,
+      true,
+    );
+  }
+
   async saveProgress(userId: number, fileId: number, dto: SaveProgressDto, user: RequestUser) {
     const file = await this.verifyFileAccess(fileId, user);
     const previous = await this.bookRepo.findProgress(userId, fileId);

@@ -1026,6 +1026,52 @@ describe('BookRepository', () => {
     );
   });
 
+  it.each([
+    [30, 'Reading'],
+    [98, 'Finished'],
+  ])('restores missing Kobo state at %s percent without requeueing snapshots', async (percentage, status) => {
+    const onConflictDoNothing = vi.fn().mockResolvedValue(undefined);
+    const values = vi.fn().mockReturnValue({ onConflictDoNothing });
+    const db = {
+      select: vi
+        .fn()
+        .mockReturnValueOnce(makeSelectChain('limit', [{ bookId: 10, primaryFileId: 9, format: 'epub', markAsFinishedPercentComplete: 98 }]))
+        .mockReturnValueOnce(makeSelectChain('limit', [])),
+      insert: vi.fn().mockReturnValue({ values }),
+      execute: vi.fn(),
+    };
+
+    await expect(new BookRepository(db as never).syncKoboReadingStateFromProgress(5, 9, percentage, null, null, null, null, true)).resolves.toBe(
+      true,
+    );
+
+    expect(values).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: 5,
+        bookId: 10,
+        currentBookmark: { LastModified: expect.any(String), ProgressPercent: percentage },
+        statusInfo: { LastModified: expect.any(String), Status: status },
+      }),
+    );
+    expect(onConflictDoNothing).toHaveBeenCalledOnce();
+    expect(db.execute).not.toHaveBeenCalled();
+  });
+
+  it('preserves a Kobo state created before restoration reaches the projection', async () => {
+    const db = {
+      select: vi
+        .fn()
+        .mockReturnValueOnce(makeSelectChain('limit', [{ bookId: 10, primaryFileId: 9, format: 'epub', markAsFinishedPercentComplete: 98 }]))
+        .mockReturnValueOnce(makeSelectChain('limit', [{ currentBookmark: { ProgressPercent: 60 } }])),
+      insert: vi.fn(),
+      execute: vi.fn(),
+    };
+
+    await expect(new BookRepository(db as never).syncKoboReadingStateFromProgress(5, 9, 30, null, null, null, null, true)).resolves.toBe(true);
+    expect(db.insert).not.toHaveBeenCalled();
+    expect(db.execute).not.toHaveBeenCalled();
+  });
+
   it('syncs primary EPUB progress into Kobo reading state and marks snapshot row pending', async () => {
     const insertChain = makeInsertChain();
     const db = {

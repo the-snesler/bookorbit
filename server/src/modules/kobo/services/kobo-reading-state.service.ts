@@ -5,6 +5,7 @@ import { NodePgDatabase } from 'drizzle-orm/node-postgres';
 
 import { DB } from '../../../db';
 import * as schema from '../../../db/schema';
+import { BookService } from '../../book/book.service';
 import { UserBookStatusService } from '../../user-book-status/user-book-status.service';
 import { ReadingSessionService } from '../../reading-session/reading-session.service';
 import { AchievementEventsService, ACHIEVEMENT_EVENT_BOOK_PROGRESS_CHANGED } from '../../achievement/achievement-events.service';
@@ -89,6 +90,7 @@ export class KoboReadingStateService {
     private readonly achievementEvents: AchievementEventsService,
     private readonly analyticsResolver: KoboAnalyticsResolverService,
     private readonly readingSessions: ReadingSessionService,
+    private readonly bookService: BookService,
   ) {}
 
   async upsertState(
@@ -351,16 +353,23 @@ export class KoboReadingStateService {
   async getRawState(userId: number, bookId: number): Promise<unknown> {
     const book = await this.db.query.books.findFirst({
       where: eq(schema.books.id, bookId),
-      columns: { id: true },
+      columns: { id: true, primaryFileId: true },
     });
     if (!book) return null;
 
     await this.bookAccessService.assertBookAccessible(userId, bookId);
 
-    const row = await this.db.query.koboReadingStates.findFirst({
+    let row = await this.db.query.koboReadingStates.findFirst({
       where: and(eq(schema.koboReadingStates.userId, userId), eq(schema.koboReadingStates.bookId, bookId)),
     });
 
+    if (!row && book.primaryFileId && (await this.settingsService.getSettings(userId)).twoWayProgressSync) {
+      if (await this.bookService.restoreKoboReadingStateFromProgress(userId, book.primaryFileId)) {
+        row = await this.db.query.koboReadingStates.findFirst({
+          where: and(eq(schema.koboReadingStates.userId, userId), eq(schema.koboReadingStates.bookId, bookId)),
+        });
+      }
+    }
     if (!row) return null;
 
     const refreshed = await this.refreshBookmarkFromHub(userId, bookId, row).catch((error: unknown) => {

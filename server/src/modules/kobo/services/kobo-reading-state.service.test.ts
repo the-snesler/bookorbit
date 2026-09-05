@@ -57,6 +57,7 @@ const ACK = (entitlementId: string, result: 'Success' | 'Ignored') => ({
 });
 
 describe('KoboReadingStateService', () => {
+  const bookService = { restoreKoboReadingStateFromProgress: vi.fn() };
   const bookAccessService = { assertBookAccessible: vi.fn() };
   const userBookStatusService = { autoUpdate: vi.fn() };
   const bookIdentityService = { ensureForBook: vi.fn() };
@@ -77,6 +78,7 @@ describe('KoboReadingStateService', () => {
       achievementEvents as never,
       analyticsResolver as never,
       readingSessions as never,
+      bookService as never,
     );
   }
 
@@ -511,6 +513,34 @@ describe('KoboReadingStateService', () => {
       Statistics: { Value: 1 },
       StatusInfo: { Status: 'ReadyToRead' },
     });
+  });
+
+  it('materializes pre-existing hub progress on the first pull after two-way sync is enabled', async () => {
+    const db = makeDb();
+    db.query.books.findFirst.mockResolvedValue({ id: 44, primaryFileId: 55 });
+    db.query.koboReadingStates.findFirst.mockResolvedValue(null);
+    bookService.restoreKoboReadingStateFromProgress.mockImplementation(() => {
+      db.query.koboReadingStates.findFirst.mockResolvedValue({
+        currentBookmark: { ProgressPercent: 30 },
+        statusInfo: { Status: 'Reading' },
+      });
+      return Promise.resolve(true);
+    });
+    const service = makeService(db);
+
+    await expect(service.getRawState(1, 44)).resolves.toBeNull();
+    expect(bookService.restoreKoboReadingStateFromProgress).not.toHaveBeenCalled();
+
+    settingsService.getSettings.mockResolvedValue({ twoWayProgressSync: true });
+    await expect(service.getRawState(1, 44)).resolves.toMatchObject({
+      EntitlementId: 'entitlement-44',
+      CurrentBookmark: { ProgressPercent: 30 },
+      StatusInfo: { Status: 'Reading' },
+    });
+    expect(bookService.restoreKoboReadingStateFromProgress).toHaveBeenCalledWith(1, 55);
+
+    await service.getRawState(1, 44);
+    expect(bookService.restoreKoboReadingStateFromProgress).toHaveBeenCalledTimes(1);
   });
 
   describe('getRawState hub bookmark refresh', () => {

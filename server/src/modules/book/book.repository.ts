@@ -2185,6 +2185,7 @@ export class BookRepository {
     koboLocationType?: string | null,
     koboLocationValue?: string | null,
     koboContentSourceProgressPercent?: number | null,
+    onlyIfMissing = false,
   ): Promise<boolean> {
     const [file] = await this.db
       .select({
@@ -2225,6 +2226,8 @@ export class BookRepository {
       .from(koboReadingStates)
       .where(and(eq(koboReadingStates.userId, userId), eq(koboReadingStates.bookId, file.bookId)))
       .limit(1);
+
+    if (onlyIfMissing && existing) return true;
 
     const existingBookmark = this.asJsonObj(existing?.currentBookmark);
     const existingStatusInfo = this.asJsonObj(existing?.statusInfo);
@@ -2284,31 +2287,36 @@ export class BookRepository {
     };
     const statistics = this.asJsonObj(existing?.statistics) ?? { LastModified: nowIso };
 
-    await this.db
-      .insert(koboReadingStates)
-      .values({
-        userId,
-        bookId: file.bookId,
-        entitlementId: existing?.entitlementId ?? String(file.bookId),
-        createdAtKobo: existing?.createdAtKobo ?? nowIso,
+    const insert = this.db.insert(koboReadingStates).values({
+      userId,
+      bookId: file.bookId,
+      entitlementId: existing?.entitlementId ?? String(file.bookId),
+      createdAtKobo: existing?.createdAtKobo ?? nowIso,
+      lastModifiedKobo: nowIso,
+      priorityTimestamp: nowIso,
+      currentBookmark,
+      statistics,
+      statusInfo,
+      updatedAt: now,
+    });
+
+    if (onlyIfMissing) {
+      // The pull is already delivering this state; do not requeue its snapshot or overwrite a concurrent device push.
+      await insert.onConflictDoNothing({ target: [koboReadingStates.userId, koboReadingStates.bookId] });
+      return true;
+    }
+
+    await insert.onConflictDoUpdate({
+      target: [koboReadingStates.userId, koboReadingStates.bookId],
+      set: {
         lastModifiedKobo: nowIso,
         priorityTimestamp: nowIso,
         currentBookmark,
         statistics,
         statusInfo,
         updatedAt: now,
-      })
-      .onConflictDoUpdate({
-        target: [koboReadingStates.userId, koboReadingStates.bookId],
-        set: {
-          lastModifiedKobo: nowIso,
-          priorityTimestamp: nowIso,
-          currentBookmark,
-          statistics,
-          statusInfo,
-          updatedAt: now,
-        },
-      });
+      },
+    });
 
     await this.markKoboSnapshotBookUnsyncedForReadingState(userId, file.bookId);
     return true;
