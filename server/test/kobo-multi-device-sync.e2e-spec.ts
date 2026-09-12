@@ -282,6 +282,87 @@ describe('Kobo multi-device library sync (e2e)', { timeout: 180_000 }, () => {
     if (ctx) await closeReaderStateIsolationE2EContext(ctx);
   });
 
+  it('repairs pre-upgrade progress in bounded pages for already-synced devices without repeating it', async () => {
+    await ctx.db
+      .insert(schema.koboSyncSettings)
+      .values({ userId, twoWayProgressSync: true })
+      .onConflictDoUpdate({ target: schema.koboSyncSettings.userId, set: { twoWayProgressSync: true } });
+    const repairA = await createDevice('Kobo repair A');
+    const repairB = await createDevice('Kobo repair B');
+    const removedDevice = await createDevice('Kobo removed books');
+    await drain(repairA);
+    await drain(repairB);
+    await drain(removedDevice);
+    const [removedSnapshot] = await ctx.db
+      .select({ id: schema.koboLibrarySnapshots.id })
+      .from(schema.koboLibrarySnapshots)
+      .where(eq(schema.koboLibrarySnapshots.deviceId, removedDevice.id));
+    await ctx.db.update(schema.koboSnapshotBooks).set({ removedByDevice: true }).where(eq(schema.koboSnapshotBooks.snapshotId, removedSnapshot!.id));
+
+    await ctx.db
+      .update(schema.koboSnapshotBooks)
+      .set({ removedByDevice: false, pendingDelete: true })
+      .where(and(eq(schema.koboSnapshotBooks.snapshotId, removedSnapshot!.id), eq(schema.koboSnapshotBooks.bookId, bookIds[0]!)));
+
+    const files = await ctx.db
+      .select({ id: schema.bookFiles.id })
+      .from(schema.books)
+      .innerJoin(schema.bookFiles, eq(schema.bookFiles.id, schema.books.primaryFileId))
+      .where(inArray(schema.books.id, bookIds));
+    await ctx.db.insert(schema.readingProgress).values(files.map(({ id }) => ({ userId, bookFileId: id, percentage: 30 })));
+    await ctx.db
+      .delete(schema.koboReadingStates)
+      .where(and(eq(schema.koboReadingStates.userId, userId), inArray(schema.koboReadingStates.bookId, bookIds)));
+
+    try {
+      const first = await sync(repairA);
+      expect(first.hasMore).toBe(true);
+      expect(newEntitlements(first.entries)).toHaveLength(0);
+      expect(changedReadingStates(first.entries)).toHaveLength(SYNC_PAGE_SIZE);
+      for (const state of changedReadingStates(first.entries)) {
+        expect(state).toMatchObject({ CurrentBookmark: { ProgressPercent: 30 }, StatusInfo: { Status: 'Reading' } });
+      }
+      const materialized = await ctx.db
+        .select({ bookId: schema.koboReadingStates.bookId })
+        .from(schema.koboReadingStates)
+        .where(and(eq(schema.koboReadingStates.userId, userId), inArray(schema.koboReadingStates.bookId, bookIds)));
+      expect(materialized).toHaveLength(SYNC_PAGE_SIZE);
+
+      const second = await sync(repairA, first.syncToken);
+      expect(second.hasMore).toBe(false);
+      expect(changedReadingStates(second.entries)).toHaveLength(1);
+      expect(changedReadingStates(second.entries)[0]).toMatchObject({ CurrentBookmark: { ProgressPercent: 30 } });
+      expect(changedReadingStates(await drainEntries(repairA))).toHaveLength(0);
+
+      const otherDeviceStates = changedReadingStates(await drainEntries(repairB));
+      expect(otherDeviceStates).toHaveLength(LIBRARY_BOOK_COUNT);
+      expect(otherDeviceStates.every((state) => (state.CurrentBookmark as { ProgressPercent: number }).ProgressPercent === 30)).toBe(true);
+      expect(changedReadingStates(await drainEntries(repairB))).toHaveLength(0);
+      const removedRows = await ctx.db
+        .select({ synced: schema.koboSnapshotBooks.synced })
+        .from(schema.koboSnapshotBooks)
+        .where(eq(schema.koboSnapshotBooks.snapshotId, removedSnapshot!.id));
+      expect(removedRows).toHaveLength(LIBRARY_BOOK_COUNT);
+      expect(removedRows.every(({ synced }) => synced)).toBe(true);
+    } finally {
+      await ctx.db.delete(schema.readingProgress).where(
+        and(
+          eq(schema.readingProgress.userId, userId),
+          inArray(
+            schema.readingProgress.bookFileId,
+            files.map(({ id }) => id),
+          ),
+        ),
+      );
+      await ctx.db
+        .delete(schema.koboReadingStates)
+        .where(and(eq(schema.koboReadingStates.userId, userId), inArray(schema.koboReadingStates.bookId, bookIds)));
+      await ctx.db
+        .delete(schema.koboDevices)
+        .where(and(eq(schema.koboDevices.userId, userId), inArray(schema.koboDevices.id, [repairA.id, repairB.id, removedDevice.id])));
+    }
+  });
+
   it('finishes pagination when Kobo echoes first-page reading states before requesting the next page', async () => {
     const settingsResponse = await ctx.app.inject({
       method: 'PATCH',

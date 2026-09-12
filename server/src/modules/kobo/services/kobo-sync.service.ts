@@ -528,6 +528,74 @@ export class KoboSyncService {
    * needs the full set, and reaching for it on every page is what makes a long delta O(library) per
    * request.
    */
+  private async queueMissingReadingStates(userId: number, snapshotId: number): Promise<boolean> {
+    const settings = await this.db.query.koboSyncSettings.findFirst({
+      where: eq(schema.koboSyncSettings.userId, userId),
+      columns: { twoWayProgressSync: true },
+    });
+    if (!settings?.twoWayProgressSync) return false;
+
+    const missing = await this.db
+      .select({ bookId: schema.koboSnapshotBooks.bookId })
+      .from(schema.koboSnapshotBooks)
+      .innerJoin(schema.books, eq(schema.books.id, schema.koboSnapshotBooks.bookId))
+      .innerJoin(schema.bookFiles, eq(schema.bookFiles.id, schema.books.primaryFileId))
+      .innerJoin(schema.readingProgress, and(eq(schema.readingProgress.bookFileId, schema.bookFiles.id), eq(schema.readingProgress.userId, userId)))
+      .leftJoin(schema.koboReadingStates, and(eq(schema.koboReadingStates.bookId, schema.books.id), eq(schema.koboReadingStates.userId, userId)))
+      .where(
+        and(
+          eq(schema.koboSnapshotBooks.snapshotId, snapshotId),
+          eq(schema.koboSnapshotBooks.pendingDelete, false),
+          eq(schema.koboSnapshotBooks.removedByDevice, false),
+          eq(schema.bookFiles.format, 'epub'),
+          isNull(schema.koboReadingStates.id),
+        ),
+      )
+      .orderBy(asc(schema.koboSnapshotBooks.bookId))
+      .limit(SYNC_PAGE_SIZE);
+    if (missing.length === 0) return false;
+
+    const startedAt = Date.now();
+    this.logger.debug(
+      `[kobo.reading_state_repair] [start] userId=${userId} snapshotId=${snapshotId} books=${missing.length} - queueing missing reading states`,
+    );
+    try {
+      // State is shared across devices: queue their delivered copies before the first pull creates it.
+      // Pending new entitlements retain isNew so the device still receives the book itself.
+      await this.db
+        .update(schema.koboSnapshotBooks)
+        .set({ synced: false, isNew: false })
+        .where(
+          and(
+            inArray(
+              schema.koboSnapshotBooks.snapshotId,
+              this.db
+                .select({ id: schema.koboLibrarySnapshots.id })
+                .from(schema.koboLibrarySnapshots)
+                .where(eq(schema.koboLibrarySnapshots.userId, userId)),
+            ),
+            inArray(
+              schema.koboSnapshotBooks.bookId,
+              missing.map(({ bookId }) => bookId),
+            ),
+            eq(schema.koboSnapshotBooks.synced, true),
+            eq(schema.koboSnapshotBooks.pendingDelete, false),
+            eq(schema.koboSnapshotBooks.removedByDevice, false),
+          ),
+        );
+      this.logger.debug(
+        `[kobo.reading_state_repair] [end] userId=${userId} snapshotId=${snapshotId} durationMs=${Date.now() - startedAt} books=${missing.length} - missing reading states queued`,
+      );
+    } catch (error: unknown) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      this.logger.warn(
+        `[kobo.reading_state_repair] [fail] userId=${userId} snapshotId=${snapshotId} durationMs=${Date.now() - startedAt} errorClass=${err.constructor.name} error="${sanitizeLogValue(err.message)}" - reading state repair failed`,
+      );
+      throw error;
+    }
+    return missing.length === SYNC_PAGE_SIZE;
+  }
+
   private async getPageFromSnapshot(
     userId: number,
     snapshotId: number,
@@ -536,6 +604,7 @@ export class KoboSyncService {
     smartScopeMatchCache: SmartScopeMatchCache,
     resolveEligibleIds: EligibleIdsResolver,
   ): Promise<{ entitlements: unknown[]; hasMore: boolean; syncToken: string }> {
+    const repairMayHaveMore = await this.queueMissingReadingStates(userId, snapshotId);
     const syncToken = encodeSyncToken(snapshotId);
 
     const pending = await this.db
@@ -545,7 +614,7 @@ export class KoboSyncService {
       .orderBy(asc(schema.koboSnapshotBooks.bookId))
       .limit(SYNC_PAGE_SIZE + 1);
 
-    const hasMore = pending.length > SYNC_PAGE_SIZE;
+    const hasMore = repairMayHaveMore || pending.length > SYNC_PAGE_SIZE;
     const page = pending.slice(0, SYNC_PAGE_SIZE);
 
     if (page.length === 0) {

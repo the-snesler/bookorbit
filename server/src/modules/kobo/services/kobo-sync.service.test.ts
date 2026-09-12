@@ -501,6 +501,26 @@ describe('KoboSyncService', () => {
     expect(bookIdentityService.markLegacyNumericRemovalComplete).not.toHaveBeenCalled();
   });
 
+  it('does not look for missing reading states while two-way sync is disabled', async () => {
+    const db = makeDb();
+    db.query.koboSyncSettings.findFirst.mockResolvedValue({ twoWayProgressSync: false });
+
+    await expect((makeService(db) as any).queueMissingReadingStates(7, 22)).resolves.toBe(false);
+
+    expect(db.select).not.toHaveBeenCalled();
+    expect(db.update).not.toHaveBeenCalled();
+  });
+
+  it('does not write to snapshots when no reading states are missing', async () => {
+    const db = makeDb({ select: [[]] });
+    db.query.koboSyncSettings.findFirst.mockResolvedValue({ twoWayProgressSync: true });
+
+    await expect((makeService(db) as any).queueMissingReadingStates(7, 22)).resolves.toBe(false);
+
+    expect(db.select).toHaveBeenCalledOnce();
+    expect(db.update).not.toHaveBeenCalled();
+  });
+
   it('getPageFromSnapshot returns tags on final page when no pending rows', async () => {
     const db = makeDb({ select: [[]] });
     const service = makeService(db);
